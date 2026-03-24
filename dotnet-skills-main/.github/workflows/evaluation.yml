@@ -1,0 +1,350 @@
+name: evaluation
+
+on:
+  pull_request:
+
+  schedule:
+    - cron: '0 8 * * *'  # Once daily at 08:00 UTC (reduced from every 3h)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  DASHBOARD_RETENTION_DAYS: 14
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  discover:
+    # Skip fork PRs (handled by evaluation-fork-pr.yml) and scheduled runs
+    # outside the canonical repo. The schedule guard uses an explicit repo
+    # name (not just the fork flag) because evaluation requires
+    # COPILOT_GITHUB_TOKEN* secrets that only exist in dotnet/skills.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'schedule' || github.repository == 'dotnet/skills')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      entries: ${{ steps.find.outputs.entries }}
+      has_entries: ${{ steps.find.outputs.has_entries }}
+      is_infra: ${{ steps.find.outputs.is_infra }}
+      plugins: ${{ steps.find.outputs.plugins }}
+      has_plugins: ${{ steps.find.outputs.has_plugins }}
+    steps:
+      - name: Check for new commits since last evaluation
+        if: github.event_name == 'schedule'
+        id: check-changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Bypass the skip guard on manual reruns so "Re-run jobs" always executes.
+          if [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; then
+            echo "Manual rerun (attempt ${GITHUB_RUN_ATTEMPT}) — bypassing skip guard"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Determine whether a new evaluation is needed by inspecting the most
+          # recent completed scheduled run.  We key off the *latest* completed
+          # run (not just the latest successful one) so that a transient failure
+          # at the current SHA still triggers a retry on the next schedule.
+          # All API calls are non-fatal: if anything fails, fall back to
+          # running the evaluation (has_changes=true).
+          LATEST=$(gh api "repos/${{ github.repository }}/actions/workflows/evaluation.yml/runs?event=schedule&status=completed&per_page=1" \
+            --jq '(.workflow_runs[0] // empty) | "\(.head_sha) \(.conclusion)"' 2>/dev/null) || LATEST=""
+
+          if [ -z "$LATEST" ]; then
+            echo "No previous completed scheduled run found — proceeding"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          LAST_SHA="${LATEST%% *}"
+          LAST_CONCLUSION="${LATEST##* }"
+          CURRENT_SHA="${{ github.sha }}"
+
+          if [ "$LAST_SHA" = "$CURRENT_SHA" ] && [ "$LAST_CONCLUSION" = "success" ]; then
+            echo "Last scheduled evaluation at $LAST_SHA succeeded — skipping"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            if [ "$LAST_SHA" != "$CURRENT_SHA" ]; then
+              # Best-effort: log commit count but don't fail if the compare call errors
+              COUNT=$(gh api "repos/${{ github.repository }}/compare/${LAST_SHA}...${CURRENT_SHA}" --jq '.total_commits' 2>/dev/null) || COUNT="unknown"
+              echo "$COUNT new commit(s) since last evaluation ($LAST_SHA)"
+            else
+              echo "Last scheduled evaluation at $LAST_SHA concluded with '$LAST_CONCLUSION' — retrying"
+            fi
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout repository
+        if: github.event_name != 'schedule' || steps.check-changes.outputs.has_changes == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find skills to evaluate
+        if: github.event_name != 'schedule' || steps.check-changes.outputs.has_changes == 'true'
+        id: find
+        run: |
+          $entries = @()
+          $plugins = @()
+
+          if ("${{ github.event_name }}" -eq "pull_request") {
+            # PR: detect individual changed skills
+            $base = "${{ github.event.pull_request.base.sha }}"
+            $head = "${{ github.event.pull_request.head.sha }}"
+            $mergeBase = git merge-base $base $head
+            $changedFiles = git diff --name-only --diff-filter=ACMR $mergeBase $head
+
+            # Check if any changed files are in infrastructure paths (evaluation workflows or eng/skill-validator/)
+            $hasInfraChanges = $changedFiles |
+              Where-Object { $_ -match '^(\.github/workflows/evaluation(-run|-fork-pr)?\.yml$|eng/skill-validator/)' } |
+              Select-Object -First 1
+
+            if ($hasInfraChanges) {
+              # Infra changes can affect any evaluation — evaluate all plugins
+              Write-Host "Infrastructure changes detected, evaluating all plugins"
+              echo "is_infra=true" >> $env:GITHUB_OUTPUT
+              $plugins = @(Get-ChildItem -Path "plugins" -Directory |
+                Where-Object { (Test-Path (Join-Path $_.FullName "skills")) -and (Test-Path (Join-Path "tests" $_.Name)) } |
+                Select-Object -ExpandProperty Name)
+              $entries = @($plugins | ForEach-Object {
+                @{ name = $_; plugin = $_; skills_path = "plugins/$_/skills" }
+              })
+            } else {
+              # Extract unique plugin/skill pairs from changed files under plugins/*/skills/*/ or tests/*/*/
+              $changedPairs = @($changedFiles |
+                Where-Object { $_ -match '^(?:plugins/([^/]+)/skills|tests/([^/]+))/([^/]+)/' } |
+                ForEach-Object {
+                  $p = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+                  "$p/$($Matches[3])"
+                } |
+                Sort-Object -Unique)
+
+              # Filter to skills that have a SKILL.md and a tests directory
+              $entries = @($changedPairs | ForEach-Object {
+                $parts = $_ -split '/'
+                $plugin = $parts[0]
+                $skill = $parts[1]
+                $skillMd = Join-Path "plugins" $plugin "skills" $skill "SKILL.md"
+                $testsDir = Join-Path "tests" $plugin
+                if ((Test-Path $skillMd) -and (Test-Path $testsDir)) {
+                  @{
+                    name = "$plugin--$skill"
+                    plugin = $plugin
+                    skills_path = "plugins/$plugin/skills/$skill"
+                  }
+                }
+              } | Where-Object { $_ })
+
+              $plugins = @($entries | ForEach-Object { $_.plugin } | Sort-Object -Unique)
+            }
+          } else {
+            # Schedule: evaluate all plugins with skills and tests
+            $plugins = @(Get-ChildItem -Path "plugins" -Directory |
+              Where-Object { (Test-Path (Join-Path $_.FullName "skills")) -and (Test-Path (Join-Path "tests" $_.Name)) } |
+              Select-Object -ExpandProperty Name)
+            $entries = @($plugins | ForEach-Object {
+              @{ name = $_; plugin = $_; skills_path = "plugins/$_/skills" }
+            })
+          }
+
+          # Output entries for evaluate matrix
+          if (-not $entries -or $entries.Count -eq 0) {
+            Write-Host "No entries to evaluate"
+            echo "entries=[]" >> $env:GITHUB_OUTPUT
+            echo "has_entries=false" >> $env:GITHUB_OUTPUT
+          } else {
+            $json = $entries | ConvertTo-Json -Compress -AsArray
+            Write-Host "Entries to evaluate: $json"
+            echo "entries=$json" >> $env:GITHUB_OUTPUT
+            echo "has_entries=true" >> $env:GITHUB_OUTPUT
+          }
+
+          # Output plugins for publish-benchmark
+          if (-not $plugins -or $plugins.Count -eq 0) {
+            echo "plugins=[]" >> $env:GITHUB_OUTPUT
+            echo "has_plugins=false" >> $env:GITHUB_OUTPUT
+          } else {
+            $cjson = $plugins | ConvertTo-Json -Compress -AsArray
+            echo "plugins=$cjson" >> $env:GITHUB_OUTPUT
+            echo "has_plugins=true" >> $env:GITHUB_OUTPUT
+          }
+        shell: pwsh
+
+  run-evaluation:
+    needs: discover
+    if: needs.discover.outputs.has_entries == 'true'
+    uses: ./.github/workflows/evaluation-run.yml
+    with:
+      entries: ${{ needs.discover.outputs.entries }}
+      runs: ${{ needs.discover.outputs.is_infra == 'true' && '1' || (github.ref == 'refs/heads/main' && '5' || '3') }}
+      # Infra changes and scheduled runs evaluate all plugins in parallel — reduce
+      # per-job concurrency to avoid API rate limits and timeouts from contention.
+      parallel-skills: ${{ (needs.discover.outputs.is_infra == 'true' || github.event_name == 'schedule') && '2' || '5' }}
+      parallel-scenarios: ${{ (needs.discover.outputs.is_infra == 'true' || github.event_name == 'schedule') && '3' || '5' }}
+      parallel-runs: ${{ (needs.discover.outputs.is_infra == 'true' || github.event_name == 'schedule') && '3' || '5' }}
+      pr-number: ${{ github.event.pull_request.number || '' }}
+    secrets:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      COPILOT_GITHUB_TOKEN_2: ${{ secrets.COPILOT_GITHUB_TOKEN_2 }}
+      COPILOT_GITHUB_TOKEN_3: ${{ secrets.COPILOT_GITHUB_TOKEN_3 }}
+      COPILOT_GITHUB_TOKEN_4: ${{ secrets.COPILOT_GITHUB_TOKEN_4 }}
+      COPILOT_GITHUB_TOKEN_5: ${{ secrets.COPILOT_GITHUB_TOKEN_5 }}
+      COPILOT_GITHUB_TOKEN_6: ${{ secrets.COPILOT_GITHUB_TOKEN_6 }}
+      COPILOT_GITHUB_TOKEN_7: ${{ secrets.COPILOT_GITHUB_TOKEN_7 }}
+      COPILOT_GITHUB_TOKEN_8: ${{ secrets.COPILOT_GITHUB_TOKEN_8 }}
+
+  # Plain check-run job that can be required in the GitHub ruleset.
+  # For fork PRs, discover is skipped (fork guard) so this job is also skipped;
+  # the fork-status job in evaluation-fork-pr.yml posts a commit status instead.
+  evaluation-status:
+    needs: [discover, run-evaluation]
+    if: always() && github.event_name == 'pull_request' && needs.discover.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check evaluation result
+        run: |
+          DISCOVER_RESULT="${{ needs.discover.result }}"
+          HAS_ENTRIES="${{ needs.discover.outputs.has_entries }}"
+          EVAL_RESULT="${{ needs.run-evaluation.result }}"
+
+          if [[ "$DISCOVER_RESULT" != "success" ]]; then
+            echo "::error::Discovery failed ($DISCOVER_RESULT)"
+            exit 1
+          elif [[ "$HAS_ENTRIES" != "true" ]]; then
+            echo "No skills to evaluate"
+          elif [[ "$EVAL_RESULT" == "success" ]]; then
+            echo "Evaluation passed"
+          else
+            echo "::error::Evaluation did not pass ($EVAL_RESULT)"
+            exit 1
+          fi
+
+  publish-benchmark:
+    needs: [discover, run-evaluation]
+    # Use !cancelled() so that benchmark data from successful plugins is still
+    # published even when one or more evaluate matrix legs fail (e.g. OOM).
+    if: >-
+      !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      needs.discover.outputs.has_plugins == 'true' &&
+      needs.discover.result == 'success'
+    concurrency:
+      group: publish-benchmark-deploy
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Download evaluation artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        with:
+          pattern: skill-validator-results-*
+          path: all-results/
+          merge-multiple: false
+        # Tolerate missing artifacts only when some evaluate legs failed (OOM,
+        # timeout). When all legs succeeded, a download failure is a real error.
+        continue-on-error: ${{ needs.run-evaluation.result != 'success' }}
+
+      - name: Fetch existing benchmark data
+        run: |
+          git fetch origin gh-pages:gh-pages 2>/dev/null || true
+          mkdir -p /tmp/gh-pages/data
+          git checkout gh-pages -- data/ 2>/dev/null && cp -r data/* /tmp/gh-pages/data/ && git checkout HEAD -- . || true
+
+      - name: Generate Benchmark Data
+        run: |
+          $sha = "${{ github.sha }}"
+          $commitMsg = git log -1 --format='%s' $sha
+          $commitTimestamp = git log -1 --format='%aI' $sha
+          $commitAuthor = git log -1 --format='%an' $sha
+
+          $commitJson = @{
+            id        = $sha
+            message   = $commitMsg
+            timestamp = $commitTimestamp
+            url       = "https://github.com/${{ github.repository }}/commit/$sha"
+            author    = @{ name = $commitAuthor; username = "${{ github.actor }}" }
+          } | ConvertTo-Json -Compress
+
+          # Process each plugin's results
+          $plugins = '${{ needs.discover.outputs.plugins }}' | ConvertFrom-Json
+          foreach ($plugin in $plugins) {
+            $artifactDir = "all-results/skill-validator-results-$plugin"
+            $runDir = Get-ChildItem -Path $artifactDir -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^\d{8}-\d{6}$' } |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+            if (-not $runDir) {
+              Write-Warning "No run results found for $plugin, skipping benchmark generation"
+              continue
+            }
+
+            $resultsFile = Join-Path $runDir.FullName "results.json"
+            Write-Host "`n=== Generating benchmark data for: $plugin ==="
+            $existingFile = "/tmp/gh-pages/data/$plugin.json"
+            $params = @{
+              ResultsFile   = $resultsFile
+              PluginName = $plugin
+              OutputDir     = "/tmp/gh-pages/data"
+              CommitJson    = $commitJson
+              RetentionDays = $env:DASHBOARD_RETENTION_DAYS
+            }
+            if ((Test-Path $existingFile) -and (Get-Content $existingFile -Raw -ErrorAction SilentlyContinue)) {
+              $params.ExistingDataFile = $existingFile
+            }
+            & ./eng/dashboard/generate-benchmark-data.ps1 @params
+          }
+
+          # Purge entries older than the configured retention window from plugin data files; delete files left with no remaining entries
+          & ./eng/dashboard/generate-benchmark-data.ps1 -PurgeStaleFiles -DataDir "/tmp/gh-pages/data" -RetentionDays $env:DASHBOARD_RETENTION_DAYS
+
+          # Generate components.json manifest
+          $plugins = Get-ChildItem -Path "/tmp/gh-pages/data" -Filter "*.json" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "components.json" } |
+            ForEach-Object { $_.BaseName }
+          @($plugins) | ConvertTo-Json -AsArray | Out-File -FilePath "/tmp/gh-pages/data/components.json" -Encoding utf8
+        shell: pwsh
+
+      - name: Deploy to GitHub Pages
+        run: |
+          cd /tmp
+          REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          if git ls-remote --exit-code --heads "$REPO_URL" gh-pages > /dev/null 2>&1; then
+            git clone --branch gh-pages --single-branch "$REPO_URL" deploy
+          else
+            mkdir deploy && cd deploy && git init && git checkout -b gh-pages
+            git remote add origin "$REPO_URL"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            cd /tmp
+          fi
+
+          cd /tmp/deploy
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p data
+          cp /tmp/gh-pages/data/*.json data/
+          cp ${{ github.workspace }}/eng/dashboard/dashboard.html index.html
+          cp ${{ github.workspace }}/eng/dashboard/dashboard.js dashboard.js
+
+          git add .
+          git diff --cached --quiet && echo "No changes to deploy" && exit 0
+          git commit -m "Update benchmark data"
+          git push origin gh-pages
